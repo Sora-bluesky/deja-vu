@@ -10,12 +10,12 @@ import (
 )
 
 // PlanCooccurrence is one factual join between a recurring wall and a plan
-// step's informative terms. The wall side is the claim: a full census found
-// a matching command logged alongside the wall in only 1 of 19 carriers (74%
-// of carriers have zero command records at all), so requiring one would
-// reject nearly every real recurrence. Command and CommandSessions are a
-// strengthening when a matching command happens to exist, not a
-// precondition — Command is "" when none was found.
+// step's informative terms. The wall side is the claim: a census of one
+// personal index found a matching command logged alongside the wall for only
+// 1 of its 19 walls, and 84 of its 110 carrier sessions hold no command
+// record at all, so requiring one would reject nearly every real recurrence.
+// Command and CommandSessions are a strengthening when a matching command
+// happens to exist, not a precondition — Command is "" when none was found.
 type PlanCooccurrence struct {
 	Wall            Friction
 	Command         string
