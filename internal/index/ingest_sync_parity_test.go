@@ -1,10 +1,12 @@
 package index
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -51,6 +53,24 @@ func TestIngestAndSyncProduceSamePostings(t *testing.T) {
 		}
 	}
 
+	// A session whose only turn is one long tool result pins the other two
+	// halves of the invariant. The text has no signal-marker lines, so
+	// signalLines keeps its head and tail and drops the middle: headonlyword
+	// sits inside the first 8 KiB, midonlyword between the head and the final
+	// 4 KiB, tailonlyword in the tail. Ingest indexes head and tail with the
+	// tool bit set and never indexes the middle; the imported copy must do
+	// exactly the same.
+	pad := strings.Repeat("plain filler that stays clear of every signal marker ", 200)
+	longTool := "headonlyword " + pad[:9000] + " midonlyword " + pad[:5000] + " tailonlyword"
+	toolJSON, err := json.Marshal(longTool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolLine := `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":` + string(toolJSON) + `}]},"timestamp":"2026-04-05T06:07:08Z","sessionId":"tool-session","cwd":"/tmp/parity"}` + "\n"
+	if err := os.WriteFile(filepath.Join(projectA, "tool.jsonl"), []byte(toolLine), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	dirA := filepath.Join(tmp, "index-a.db")
 	if err := Ensure(dirA, "", false, nil); err != nil {
 		t.Fatal(err)
@@ -64,6 +84,7 @@ func TestIngestAndSyncProduceSamePostings(t *testing.T) {
 		"cjk-session":     false,
 		"english-session": false,
 		"repeat-session":  false,
+		"tool-session":    false,
 	}
 	if len(sourceManifest.Sessions) != len(wantSourceIDs) {
 		t.Fatalf("ingest produced %d sessions, want %d", len(sourceManifest.Sessions), len(wantSourceIDs))
@@ -194,6 +215,34 @@ func TestIngestAndSyncProduceSamePostings(t *testing.T) {
 	}
 	if !repeatedTF {
 		t.Fatal("repeated-word fixture did not produce a token with tf greater than one")
+	}
+
+	// The tokenizedPart half: the middle of the long tool output earns no
+	// posting on either route, while its head and tail do.
+	if _, ok := ingested["tmidonlyword"]; ok {
+		t.Fatal("ingest indexed the middle of a long tool output; the fixture no longer exercises signalLines")
+	}
+	if _, ok := synced["tmidonlyword"]; ok {
+		t.Fatal("import indexed the middle of a long tool output that ingest drops")
+	}
+
+	// The tool-bit half: postings for the tool-only session carry Tool on
+	// both routes.
+	for _, dir := range []string{dirA, dirB} {
+		for _, tok := range []string{"theadonlyword", "ttailonlyword"} {
+			posts, err := postingsFor(dir, tok)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(posts) == 0 {
+				t.Fatalf("%s holds no postings for %q", dir, tok)
+			}
+			for _, p := range posts {
+				if !p.Tool {
+					t.Fatalf("%s posting for %q lost the tool bit", dir, tok)
+				}
+			}
+		}
 	}
 
 	tokenSet := make(map[string]struct{}, len(ingested)+len(synced))
