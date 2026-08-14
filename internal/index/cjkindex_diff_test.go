@@ -161,6 +161,28 @@ func TestCJKIndexKeysFoldCollision492(t *testing.T) {
 	}
 }
 
+// The byte-identical buckets/ check testifies for ingestion only. The query
+// side still depends on cjkBigrams emitting unfolded bigrams — the
+// function-word filter must see the runes the user typed — and that has no
+// index artifact to diff, so this pins it directly: Traditional-script input
+// through expandCJKTokens keeps its script, before and after the ingestion
+// emitter split (#492).
+func TestExpandCJKTokensKeepsScript492(t *testing.T) {
+	got := expandCJKTokens([]string{"韓國簽證"})
+	want := []string{"韓國", "國簽", "簽證"}
+	if len(got) != len(want) {
+		t.Fatalf("expandCJKTokens(韓國簽證) = %q, want %q", got, want)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Fatalf("expandCJKTokens(韓國簽證)[%d] = %q, want %q (folded or reordered)", i, got[i], w)
+		}
+	}
+	if f := cjkfold.String("韓國"); f == "韓國" {
+		t.Fatalf("fixture lost its point: %q does not fold", "韓國")
+	}
+}
+
 // The benchmarks pit the new emitter and shard function against the legacy
 // copies above inside one binary, so the comparison is immune to the
 // binary-layout variance that dominates whole-build wall clocks on small
