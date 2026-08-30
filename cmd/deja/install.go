@@ -1949,33 +1949,6 @@ func replacedEntryNote(prev, entry any) string {
 	return fmt.Sprintf("replaced the deja entry that was already here, which ran %s", safeForStatusline(was, 200))
 }
 
-func entryRunsDeja(entry map[string]any) bool {
-	var words []string
-	switch c := entry["command"].(type) {
-	case string:
-		words = append(words, c)
-	case []any:
-		for _, v := range c {
-			if s, ok := v.(string); ok {
-				words = append(words, s)
-			}
-		}
-	}
-	if args, ok := entry["args"].([]any); ok {
-		for _, v := range args {
-			if s, ok := v.(string); ok {
-				words = append(words, s)
-			}
-		}
-	}
-	for _, w := range words {
-		if isDejaBinaryToken(w) {
-			return true
-		}
-	}
-	return false
-}
-
 // mergeDejaEntry writes deja's wiring onto the entry that was already there.
 // deja owns the command, the args and the type; an env pointing at a store on
 // another disk, a timeout, a `disabled` the reader set — those are theirs, and
