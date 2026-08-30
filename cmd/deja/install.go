@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/vshulcz/deja-vu/internal/digest"
@@ -1135,6 +1136,7 @@ func installClaude(exe string, uninstall bool) (installResult, error) {
 	}
 	if uninstall {
 		delete(m, "deja")
+		note = leftDejaEntriesNote(m)
 		// And the block itself, when deja is what put it there: a config the
 		// reader owned came back with an empty `mcpServers` they never wrote,
 		// while the copy install promised sat beside it holding the real thing
@@ -1144,7 +1146,8 @@ func installClaude(exe string, uninstall bool) (installResult, error) {
 			forgetBlockAdded(path, "mcpServers")
 		}
 	} else {
-		m["deja"], note = mergeDejaEntry(m["deja"], mcpServerEntry(exe))
+		key := dejaEntryKey(m)
+		m[key], note = mergeDejaEntry(m[key], mcpServerEntry(exe))
 	}
 	next, err := json.MarshalIndent(root, "", "  ")
 	if err != nil {
@@ -1493,28 +1496,342 @@ func installGrok(exe string, uninstall bool) (installResult, error) {
 		return res, uerr
 	}
 	if res.Action == "unchanged" {
+		if res.Note != "" {
+			if user.Note != "" {
+				user.Note = res.Note + "; " + user.Note
+			} else {
+				user.Note = res.Note
+			}
+		}
 		return user, nil
 	}
 	return res, nil
 }
 
+type tomlMCPBlock struct {
+	key        string
+	start, end int
+}
+
 func installTOML(path, block string, uninstall bool) (installResult, error) {
 	old, _ := os.ReadFile(path)
+	text := lfText(old)
+	blocks := tomlMCPBlocks(text)
+	hasDeja := false
+	for _, b := range blocks {
+		if b.key == "deja" {
+			hasDeja = true
+			break
+		}
+	}
+	if !uninstall && !hasDeja {
+		if key := foreignTOMLDejaKey(text); key != "" {
+			next := []byte(updateTOMLMCPBlock(text, key, block))
+			a, err := writeIfChanged(path, old, next)
+			return installResult{
+				Path:   path,
+				Action: a,
+				Note:   fmt.Sprintf("updated %q, which already ran deja, instead of adding a second entry", key),
+			}, err
+		}
+	}
+
 	// The splicing below counts newlines, so it works in LF and writeIfChanged
 	// puts the file's own endings back. Left as read, a CRLF file grew a blank
 	// line per install: TrimRight("\n") leaves the carriage return behind.
-	s := removeCodexDejaBlock(lfText(old))
+	s := removeCodexDejaBlock(text)
 	s = strings.TrimRight(s, "\n")
+	var note string
 	if !uninstall {
 		if s != "" {
 			s += "\n\n"
 		}
 		s += block
-	} else if s != "" {
-		s += "\n"
+	} else {
+		note = leftNamedDejaEntriesNote(foreignTOMLDejaKeys(s))
+		if s != "" {
+			s += "\n"
+		}
 	}
 	a, err := writeIfChanged(path, old, []byte(s))
-	return installResult{Path: path, Action: a}, err
+	return installResult{Path: path, Action: a, Note: note}, err
+}
+
+func tomlMCPBlocks(s string) []tomlMCPBlock {
+	lines := strings.Split(s, "\n")
+	var out []tomlMCPBlock
+	for i, line := range lines {
+		key, ok := tomlMCPHeader(line)
+		if !ok {
+			continue
+		}
+		end := len(lines)
+		for j := i + 1; j < len(lines); j++ {
+			if strings.HasPrefix(strings.TrimSpace(lines[j]), "[") {
+				end = j
+				break
+			}
+		}
+		out = append(out, tomlMCPBlock{key: key, start: i, end: end})
+	}
+	return out
+}
+
+// tomlMCPHeader reads the key out of an `[mcp_servers.X]` line. Through
+// tomlCode first: a header is as entitled to a trailing comment as a value
+// line, and requiring the bracket to end the raw line dropped the whole block
+// — install then appended the duplicate this change exists to stop.
+func tomlMCPHeader(line string) (string, bool) {
+	line = tomlCode(line)
+	const prefix = "[mcp_servers."
+	if !strings.HasPrefix(line, prefix) || !strings.HasSuffix(line, "]") {
+		return "", false
+	}
+	key := strings.TrimSuffix(strings.TrimPrefix(line, prefix), "]")
+	if key == "" || strings.ContainsAny(key, "[]") {
+		return "", false
+	}
+	return key, true
+}
+
+func foreignTOMLDejaKey(s string) string {
+	keys := foreignTOMLDejaKeys(s)
+	if len(keys) == 0 {
+		return ""
+	}
+	return keys[0]
+}
+
+func foreignTOMLDejaKeys(s string) []string {
+	lines := strings.Split(s, "\n")
+	seen := map[string]bool{}
+	var keys []string
+	for _, b := range tomlMCPBlocks(s) {
+		if b.key == "deja" || seen[b.key] || !tomlBlockRunsDeja(lines, b) {
+			continue
+		}
+		seen[b.key] = true
+		keys = append(keys, b.key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func tomlBlockRunsDeja(lines []string, block tomlMCPBlock) bool {
+	for i := block.start + 1; i < block.end; i++ {
+		key, value, ok := tomlLineKeyValue(lines[i])
+		if !ok {
+			continue
+		}
+		switch key {
+		case "command":
+			for _, value := range tomlStringValues(value) {
+				if commandIsDeja(value) {
+					return true
+				}
+			}
+		case "args":
+			value, i = tomlArrayValue(lines, i, block.end, value)
+			for _, value := range tomlStringValues(value) {
+				if commandIsDeja(value) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func tomlLineKeyValue(line string) (string, string, bool) {
+	line = tomlCode(line)
+	key, value, ok := strings.Cut(line, "=")
+	if !ok {
+		return "", "", false
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return "", "", false
+	}
+	return key, strings.TrimSpace(value), true
+}
+
+// tomlCode strips a line's trailing comment without misreading a `#` inside a
+// quoted value — a Windows path or an arg can carry one, and cutting there
+// would hand back half a string.
+func tomlCode(line string) string {
+	var out strings.Builder
+	var quote byte
+	escaped := false
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		if quote != 0 {
+			out.WriteByte(c)
+			if quote == '"' && escaped {
+				escaped = false
+				continue
+			}
+			if quote == '"' && c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		if c == '#' {
+			break
+		}
+		if c == '"' || c == '\'' {
+			quote = c
+		}
+		out.WriteByte(c)
+	}
+	return strings.TrimSpace(out.String())
+}
+
+func tomlArrayValue(lines []string, start, end int, value string) (string, int) {
+	depth := tomlArrayDelta(value)
+	if depth <= 0 {
+		return value, start
+	}
+	var out strings.Builder
+	out.WriteString(value)
+	i := start
+	for i+1 < end && depth > 0 {
+		i++
+		line := tomlCode(lines[i])
+		out.WriteByte('\n')
+		out.WriteString(line)
+		depth += tomlArrayDelta(line)
+	}
+	return out.String(), i
+}
+
+func tomlArrayDelta(s string) int {
+	depth := 0
+	var quote byte
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if quote != 0 {
+			if quote == '"' && escaped {
+				escaped = false
+				continue
+			}
+			if quote == '"' && c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '"', '\'':
+			quote = c
+		case '[':
+			depth++
+		case ']':
+			depth--
+		}
+	}
+	return depth
+}
+
+func tomlStringValues(s string) []string {
+	var out []string
+	for i := 0; i < len(s); i++ {
+		quote := s[i]
+		if quote != '"' && quote != '\'' {
+			continue
+		}
+		start := i
+		escaped := false
+		for i++; i < len(s); i++ {
+			c := s[i]
+			if quote == '"' && escaped {
+				escaped = false
+				continue
+			}
+			if quote == '"' && c == '\\' {
+				escaped = true
+				continue
+			}
+			if c != quote {
+				continue
+			}
+			if quote == '\'' {
+				out = append(out, s[start+1:i])
+			} else if value, err := strconv.Unquote(s[start : i+1]); err == nil {
+				out = append(out, value)
+			}
+			break
+		}
+	}
+	return out
+}
+
+// updateTOMLMCPBlock rewrites the wiring inside `[mcp_servers.key]` and keeps
+// every line deja does not own. The block is somebody's hand work — a
+// startup timeout, an env, a comment — and the JSON side already promises the
+// same through mergeDejaEntry (#2269).
+func updateTOMLMCPBlock(s, key, replacement string) string {
+	lines := strings.Split(s, "\n")
+	var target tomlMCPBlock
+	found := false
+	for _, block := range tomlMCPBlocks(s) {
+		if block.key == key {
+			target = block
+			found = true
+			break
+		}
+	}
+	if !found {
+		return s
+	}
+	var owned []string
+	replacementLines := strings.Split(strings.TrimRight(replacement, "\n"), "\n")
+	for _, line := range replacementLines[1:] {
+		k, _, ok := tomlLineKeyValue(line)
+		if ok && tomlOwnedMCPKey(k) {
+			owned = append(owned, line)
+		}
+	}
+
+	body := make([]string, 0, target.end-target.start)
+	inserted := false
+	for i := target.start + 1; i < target.end; i++ {
+		k, value, ok := tomlLineKeyValue(lines[i])
+		if !ok || !tomlOwnedMCPKey(k) {
+			body = append(body, lines[i])
+			continue
+		}
+		if !inserted {
+			body = append(body, owned...)
+			inserted = true
+		}
+		if k == "args" {
+			_, i = tomlArrayValue(lines, i, target.end, value)
+		}
+	}
+	if !inserted {
+		body = append(owned, body...)
+	}
+
+	out := append([]string{}, lines[:target.start+1]...)
+	out = append(out, body...)
+	out = append(out, lines[target.end:]...)
+	return strings.Join(out, "\n")
+}
+
+func tomlOwnedMCPKey(key string) bool {
+	switch key {
+	case "type", "command", "args":
+		return true
+	}
+	return false
 }
 
 func removeCodexDejaBlock(s string) string {
@@ -1541,6 +1858,70 @@ func homeDir() string {
 
 func antigravityConfigHome() string {
 	return filepath.Join(homeDir(), ".gemini", "config")
+}
+
+// dejaEntryKey keeps one MCP server when somebody wired deja by hand under a
+// different name — `deja-vu` is the obvious choice. Install must update that
+// entry rather than add a sibling that starts the server twice (#2269).
+func dejaEntryKey(m map[string]any) string {
+	if _, ok := m["deja"]; ok {
+		return "deja"
+	}
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		if key != "deja" {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if mcpEntryRunsDeja(m[key]) {
+			return key
+		}
+	}
+	return "deja"
+}
+
+// leftDejaEntriesNote names what uninstall deliberately leaves behind: an
+// entry deja never wrote, still running deja under another name. Deleting a
+// hand add is worse than leaving it, and leaving it without a word looks like
+// an uninstall that missed one (#2269).
+func leftDejaEntriesNote(m map[string]any) string {
+	var keys []string
+	for key, entry := range m {
+		if key != "deja" && mcpEntryRunsDeja(entry) {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	return leftNamedDejaEntriesNote(keys)
+}
+
+func leftNamedDejaEntriesNote(keys []string) string {
+	if len(keys) == 0 {
+		return ""
+	}
+	quoted := make([]string, len(keys))
+	for i, key := range keys {
+		quoted[i] = fmt.Sprintf("%q", key)
+	}
+	if len(quoted) == 1 {
+		return fmt.Sprintf("left %s, which also runs deja — deja did not write it, so uninstall does not remove it", quoted[0])
+	}
+	return fmt.Sprintf("left %s, which also run deja — deja did not write them, so uninstall does not remove them", naturalList(quoted))
+}
+
+func naturalList(xs []string) string {
+	switch len(xs) {
+	case 0:
+		return ""
+	case 1:
+		return xs[0]
+	case 2:
+		return xs[0] + " and " + xs[1]
+	default:
+		return strings.Join(xs[:len(xs)-1], ", ") + ", and " + xs[len(xs)-1]
+	}
 }
 
 // replacedEntryNote names the deja wiring someone had in a config before
@@ -1608,7 +1989,7 @@ func mergeDejaEntry(prev any, entry map[string]any) (map[string]any, string) {
 	// else's entry — a `url` of a remote server, an env built for another
 	// program — would leave a mixed shape whose client has to guess which half
 	// to believe.
-	if !ok || !entryRunsDeja(old) {
+	if !ok || !mcpEntryRunsDeja(old) {
 		return entry, note
 	}
 	out := make(map[string]any, len(old)+len(entry))
@@ -1723,6 +2104,7 @@ func installCopilotMCP(exe string, uninstall bool) (installResult, error) {
 	}
 	if uninstall {
 		delete(m, "deja")
+		note = leftDejaEntriesNote(m)
 		// And the block, when deja is what put it there (#2604).
 		if len(m) == 0 && blockWasAdded(path, "mcpServers") {
 			delete(root, "mcpServers")
@@ -1730,7 +2112,8 @@ func installCopilotMCP(exe string, uninstall bool) (installResult, error) {
 		}
 	} else {
 		command, args := mcpCommandArgs(exe)
-		m["deja"], note = mergeDejaEntry(m["deja"], map[string]any{"type": "local", "command": command, "args": args, "tools": []string{"*"}})
+		key := dejaEntryKey(m)
+		m[key], note = mergeDejaEntry(m[key], map[string]any{"type": "local", "command": command, "args": args, "tools": []string{"*"}})
 	}
 	next, err := json.MarshalIndent(root, "", "  ")
 	if err != nil {
@@ -1778,6 +2161,7 @@ func installOpenClawMCP(exe string, uninstall bool) (installResult, error) {
 	}
 	if uninstall {
 		delete(servers, "deja")
+		note = leftDejaEntriesNote(servers)
 		if len(servers) == 0 && blockWasAdded(path, "mcp.servers") {
 			delete(mcp, "servers")
 			if len(mcp) == 0 {
@@ -1787,7 +2171,8 @@ func installOpenClawMCP(exe string, uninstall bool) (installResult, error) {
 		}
 	} else {
 		command, args := mcpCommandArgs(exe)
-		servers["deja"], note = mergeDejaEntry(servers["deja"], map[string]any{"command": command, "args": args})
+		key := dejaEntryKey(servers)
+		servers[key], note = mergeDejaEntry(servers[key], map[string]any{"command": command, "args": args})
 	}
 	next, err := json.MarshalIndent(root, "", "  ")
 	if err != nil {
@@ -1828,6 +2213,7 @@ func installMCPJSON(path, exe string, uninstall bool) (installResult, error) {
 	}
 	if uninstall {
 		delete(m, "deja")
+		note = leftDejaEntriesNote(m)
 		// And the block, when deja is what put it there (#2604).
 		if len(m) == 0 && blockWasAdded(path, "mcpServers") {
 			delete(root, "mcpServers")
@@ -1835,7 +2221,8 @@ func installMCPJSON(path, exe string, uninstall bool) (installResult, error) {
 		}
 	} else {
 		command, args := mcpCommandArgs(exe)
-		m["deja"], note = mergeDejaEntry(m["deja"], map[string]any{"command": command, "args": args})
+		key := dejaEntryKey(m)
+		m[key], note = mergeDejaEntry(m[key], map[string]any{"command": command, "args": args})
 	}
 	next, err := json.MarshalIndent(root, "", "  ")
 	if err != nil {
@@ -1891,8 +2278,10 @@ func updateOpencodeJSON(old []byte, exe string, uninstall bool) ([]byte, string,
 	}
 	if uninstall {
 		delete(m, "deja")
+		note = leftDejaEntriesNote(m)
 	} else {
-		m["deja"], note = mergeDejaEntry(m["deja"], map[string]any{"type": "local", "command": []string{exe, "mcp"}})
+		key := dejaEntryKey(m)
+		m[key], note = mergeDejaEntry(m[key], map[string]any{"type": "local", "command": []string{exe, "mcp"}})
 	}
 	next, err := json.MarshalIndent(root, "", "  ")
 	if err != nil {
