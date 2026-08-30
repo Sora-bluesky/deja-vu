@@ -68,9 +68,10 @@ func serveMCPProcess(dir string, r io.Reader, w io.Writer) error {
 	var lastRead atomic.Int64
 	lastRead.Store(time.Now().UnixNano())
 
-	// Read once, deliberately: on unix an orphaned process is reparented and a
-	// live Getppid answers 1 forever after, so only the pid recorded at start
-	// can ever go dead — a later call would watch init and never fire.
+	// Read once, deliberately: on unix an orphaned process is reparented — to
+	// init or a subreaper — and a live Getppid answers that adopter from then
+	// on, so only the pid recorded at start can ever go dead. A later call
+	// would watch a process that is alive by construction, and never fire.
 	//
 	// Windows reports -1 when the parent cannot be read; processAlive calls
 	// that dead, and the AND would quietly collapse into the idle timeout the
