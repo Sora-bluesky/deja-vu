@@ -21,7 +21,9 @@ func processAlive(pid int) bool {
 	if err != nil {
 		return false
 	}
-	defer p.Release()
+	// Release frees the handle; nothing can be done if it fails and the answer
+	// below is what the caller asked for.
+	defer func() { _ = p.Release() }()
 	err = p.Signal(syscall.Signal(0))
 	return err == nil || errors.Is(err, os.ErrPermission)
 }
