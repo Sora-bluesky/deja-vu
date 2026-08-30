@@ -1949,9 +1949,6 @@ func replacedEntryNote(prev, entry any) string {
 	return fmt.Sprintf("replaced the deja entry that was already here, which ran %s", safeForStatusline(was, 200))
 }
 
-// entryRunsDeja reports whether an MCP entry runs the deja binary, wherever the
-// config keeps it: a command string, a command list, or the args behind a
-// wrapper like Windows' `cmd /c`.
 func entryRunsDeja(entry map[string]any) bool {
 	var words []string
 	switch c := entry["command"].(type) {
