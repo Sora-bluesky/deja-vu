@@ -68,7 +68,13 @@ func serveMCPProcess(dir string, r io.Reader, w io.Writer) error {
 	var lastRead atomic.Int64
 	lastRead.Store(time.Now().UnixNano())
 
+	// Windows reports -1 when the parent cannot be read; processAlive calls
+	// that dead, and the AND would quietly collapse into the idle timeout the
+	// design rejected. No recorded parent, no watch — EOF still works.
 	ppid := os.Getppid()
+	if ppid <= 0 {
+		return serveMCP(dir, r, w)
+	}
 	stop := startOrphanWatch(
 		ppid,
 		func() time.Time {

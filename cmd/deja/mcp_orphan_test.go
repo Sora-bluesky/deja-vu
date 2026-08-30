@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -25,12 +26,16 @@ func mcpOrphanHelper(mode string) *exec.Cmd {
 	return cmd
 }
 
+// deadMCPProcessPID returns a pid that no longer runs while the *exec.Cmd
+// still holds its process handle — the exact state where OpenProcess keeps
+// succeeding, so a FindProcess-only processAlive fails here by construction.
 func deadMCPProcessPID(t *testing.T) int {
 	t.Helper()
 	cmd := mcpOrphanHelper("exit")
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("run helper process: %v", err)
 	}
+	t.Cleanup(func() { runtime.KeepAlive(cmd) })
 	return cmd.Process.Pid
 }
 

@@ -17,7 +17,9 @@ func processAlive(pid int) bool {
 	const processQueryLimitedInformation = 0x1000
 	h, err := syscall.OpenProcess(processQueryLimitedInformation, false, uint32(pid))
 	if err != nil {
-		return false
+		// A process this one may not open still exists — the unix side reads
+		// EPERM the same way.
+		return err == syscall.ERROR_ACCESS_DENIED
 	}
 	defer syscall.CloseHandle(h)
 	var code uint32
