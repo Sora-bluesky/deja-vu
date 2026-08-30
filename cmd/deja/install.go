@@ -1136,6 +1136,7 @@ func installClaude(exe string, uninstall bool) (installResult, error) {
 	}
 	if uninstall {
 		delete(m, "deja")
+		removeAdoptedDejaEntries(path, "mcpServers", m)
 		note = leftDejaEntriesNote(m)
 		// And the block itself, when deja is what put it there: a config the
 		// reader owned came back with an empty `mcpServers` they never wrote,
@@ -1147,6 +1148,9 @@ func installClaude(exe string, uninstall bool) (installResult, error) {
 		}
 	} else {
 		key := dejaEntryKey(m)
+		if key != "deja" {
+			noteBlockAdded(path, "mcpServers."+key)
+		}
 		m[key], note = mergeDejaEntry(m[key], mcpServerEntry(exe))
 	}
 	next, err := json.MarshalIndent(root, "", "  ")
@@ -1526,6 +1530,7 @@ func installTOML(path, block string, uninstall bool) (installResult, error) {
 	}
 	if !uninstall && !hasDeja {
 		if key := foreignTOMLDejaKey(text); key != "" {
+			noteBlockAdded(path, "mcp_servers."+key)
 			next := []byte(updateTOMLMCPBlock(text, key, block))
 			a, err := writeIfChanged(path, old, next)
 			return installResult{
@@ -1540,6 +1545,15 @@ func installTOML(path, block string, uninstall bool) (installResult, error) {
 	// puts the file's own endings back. Left as read, a CRLF file grew a blank
 	// line per install: TrimRight("\n") leaves the carriage return behind.
 	s := removeCodexDejaBlock(text)
+	if uninstall {
+		for _, key := range foreignTOMLDejaKeys(s) {
+			name := "mcp_servers." + key
+			if blockWasAdded(path, name) {
+				s = removeTOMLMCPBlock(s, key)
+				forgetBlockAdded(path, name)
+			}
+		}
+	}
 	s = strings.TrimRight(s, "\n")
 	var note string
 	if !uninstall {
@@ -1835,20 +1849,7 @@ func tomlOwnedMCPKey(key string) bool {
 }
 
 func removeCodexDejaBlock(s string) string {
-	lines := strings.Split(s, "\n")
-	var out []string
-	for i := 0; i < len(lines); i++ {
-		if strings.TrimSpace(lines[i]) != "[mcp_servers.deja]" {
-			out = append(out, lines[i])
-			continue
-		}
-		i++
-		for i < len(lines) && !strings.HasPrefix(strings.TrimSpace(lines[i]), "[") {
-			i++
-		}
-		i--
-	}
-	return strings.Join(out, "\n")
+	return removeTOMLMCPBlock(s, "deja")
 }
 
 func homeDir() string {
@@ -2104,6 +2105,7 @@ func installCopilotMCP(exe string, uninstall bool) (installResult, error) {
 	}
 	if uninstall {
 		delete(m, "deja")
+		removeAdoptedDejaEntries(path, "mcpServers", m)
 		note = leftDejaEntriesNote(m)
 		// And the block, when deja is what put it there (#2604).
 		if len(m) == 0 && blockWasAdded(path, "mcpServers") {
@@ -2113,6 +2115,9 @@ func installCopilotMCP(exe string, uninstall bool) (installResult, error) {
 	} else {
 		command, args := mcpCommandArgs(exe)
 		key := dejaEntryKey(m)
+		if key != "deja" {
+			noteBlockAdded(path, "mcpServers."+key)
+		}
 		m[key], note = mergeDejaEntry(m[key], map[string]any{"type": "local", "command": command, "args": args, "tools": []string{"*"}})
 	}
 	next, err := json.MarshalIndent(root, "", "  ")
@@ -2161,6 +2166,7 @@ func installOpenClawMCP(exe string, uninstall bool) (installResult, error) {
 	}
 	if uninstall {
 		delete(servers, "deja")
+		removeAdoptedDejaEntries(path, "mcp.servers", servers)
 		note = leftDejaEntriesNote(servers)
 		if len(servers) == 0 && blockWasAdded(path, "mcp.servers") {
 			delete(mcp, "servers")
@@ -2172,6 +2178,9 @@ func installOpenClawMCP(exe string, uninstall bool) (installResult, error) {
 	} else {
 		command, args := mcpCommandArgs(exe)
 		key := dejaEntryKey(servers)
+		if key != "deja" {
+			noteBlockAdded(path, "mcp.servers."+key)
+		}
 		servers[key], note = mergeDejaEntry(servers[key], map[string]any{"command": command, "args": args})
 	}
 	next, err := json.MarshalIndent(root, "", "  ")
@@ -2213,6 +2222,7 @@ func installMCPJSON(path, exe string, uninstall bool) (installResult, error) {
 	}
 	if uninstall {
 		delete(m, "deja")
+		removeAdoptedDejaEntries(path, "mcpServers", m)
 		note = leftDejaEntriesNote(m)
 		// And the block, when deja is what put it there (#2604).
 		if len(m) == 0 && blockWasAdded(path, "mcpServers") {
@@ -2222,6 +2232,9 @@ func installMCPJSON(path, exe string, uninstall bool) (installResult, error) {
 	} else {
 		command, args := mcpCommandArgs(exe)
 		key := dejaEntryKey(m)
+		if key != "deja" {
+			noteBlockAdded(path, "mcpServers."+key)
+		}
 		m[key], note = mergeDejaEntry(m[key], map[string]any{"command": command, "args": args})
 	}
 	next, err := json.MarshalIndent(root, "", "  ")
@@ -2248,7 +2261,7 @@ func installOpencode(exe string, uninstall bool) (installResult, error) {
 	if strings.HasSuffix(path, ".jsonc") {
 		next, note, err = updateOpencodeJSONC(old, exe, uninstall)
 	} else {
-		next, note, err = updateOpencodeJSON(old, exe, uninstall)
+		next, note, err = updateOpencodeJSON(old, path, exe, uninstall)
 	}
 	if err != nil {
 		return installResult{}, configParseError(path, err)
@@ -2257,7 +2270,7 @@ func installOpencode(exe string, uninstall bool) (installResult, error) {
 	return installResult{Path: path, Action: a, Note: note}, err
 }
 
-func updateOpencodeJSON(old []byte, exe string, uninstall bool) ([]byte, string, error) {
+func updateOpencodeJSON(old []byte, path, exe string, uninstall bool) ([]byte, string, error) {
 	var root map[string]any
 	var note string
 	if len(bytes.TrimSpace(old)) == 0 {
@@ -2278,9 +2291,13 @@ func updateOpencodeJSON(old []byte, exe string, uninstall bool) ([]byte, string,
 	}
 	if uninstall {
 		delete(m, "deja")
+		removeAdoptedDejaEntries(path, "mcp", m)
 		note = leftDejaEntriesNote(m)
 	} else {
 		key := dejaEntryKey(m)
+		if key != "deja" {
+			noteBlockAdded(path, "mcp."+key)
+		}
 		m[key], note = mergeDejaEntry(m[key], map[string]any{"type": "local", "command": []string{exe, "mcp"}})
 	}
 	next, err := json.MarshalIndent(root, "", "  ")
@@ -2715,4 +2732,45 @@ func installTargetNames() []string {
 // answer checkable from any machine.
 func syncTimerSchedulable(goos string) bool {
 	return goos == "darwin" || goos == "linux"
+}
+
+// removeAdoptedDejaEntries removes only renamed entries an install claimed;
+// hand wiring without that ownership record must survive uninstall (#2648).
+func removeAdoptedDejaEntries(path, container string, m map[string]any) {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if !mcpEntryRunsDeja(m[key]) {
+			continue
+		}
+		name := container + "." + key
+		if blockWasAdded(path, name) {
+			delete(m, key)
+			forgetBlockAdded(path, name)
+		}
+	}
+}
+
+// removeTOMLMCPBlock removes one named MCP table without disturbing its
+// siblings; reading the header as TOML code keeps adopted commented blocks
+// removable on uninstall (#2648).
+func removeTOMLMCPBlock(s, key string) string {
+	lines := strings.Split(s, "\n")
+	var out []string
+	for i := 0; i < len(lines); i++ {
+		found, ok := tomlMCPHeader(lines[i])
+		if !ok || found != key {
+			out = append(out, lines[i])
+			continue
+		}
+		i++
+		for i < len(lines) && !strings.HasPrefix(strings.TrimSpace(lines[i]), "[") {
+			i++
+		}
+		i--
+	}
+	return strings.Join(out, "\n")
 }

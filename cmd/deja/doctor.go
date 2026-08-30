@@ -1300,6 +1300,7 @@ func mcpEntryRunsDeja(v any) bool {
 			return true
 		}
 	case []any:
+		// Opencode's entry keeps the command as one list, written by deja's own installer.
 		for _, word := range cmd {
 			if s, ok := word.(string); ok && commandIsDeja(s) {
 				return true
