@@ -476,6 +476,15 @@ func eval(out string, features bool) error {
 	fmt.Println("\n== detector on these labels (weighted to the index)")
 	verdict("as sampled", func(it item) bool { return it.Accepted })
 	verdict("current code", func(it item) bool { return rescore(it).Accepted })
+	// Alternative acceptance rules over the same current signals, so the
+	// ceiling of each can be read off one run.
+	strong := func(s index.CorrectionSignals) bool {
+		return s.Kind == index.CorrectionNegation || s.Kind == index.CorrectionRepeat || s.Kind == index.CorrectionUnasked
+	}
+	verdict("ack only", func(it item) bool { return rescore(it).Apology != "" })
+	verdict("ack or strong mark", func(it item) bool { s := rescore(it); return s.Apology != "" || strong(s) })
+	verdict("ack or any marker", func(it item) bool { s := rescore(it); return s.Apology != "" || s.Marker != "" })
+	verdict("strong mark only", func(it item) bool { return strong(rescore(it)) })
 
 	// Each labelled turn stands for population/labelled turns of its stratum,
 	// so signal rates describe the index rather than the sample's mix.
@@ -638,11 +647,20 @@ func printFeatures(items []item) {
 			p.no++
 		}
 	}
+	// The same turn can be sampled more than once — a harness that logs a
+	// message twice, a prompt pasted into several sessions — and one turn
+	// counted seven times filled the first fragment list on its own.
+	counted := map[string]bool{}
 	for _, it := range items {
 		yes, no := it.Label == "d" || it.Label == "w", it.Label == "n"
 		if !yes && !no {
 			continue
 		}
+		key := strings.TrimSpace(it.User)
+		if counted[key] {
+			continue
+		}
+		counted[key] = true
 		if yes {
 			nYes++
 		} else {
@@ -659,7 +677,9 @@ func printFeatures(items []item) {
 		for size := 2; size <= 3; size++ {
 			for i := 0; i+size <= len(r); i++ {
 				g := string(r[i : i+size])
-				if strings.ContainsAny(g, " \t\n、。，．,.") || seen[g] {
+				// Fragments that are all ASCII are identifiers and paths, which
+				// say what the work was about, not how the turn was said.
+				if strings.ContainsAny(g, " \t\n、。，．,.") || seen[g] || isASCII(g) {
 					continue
 				}
 				seen[g] = true
@@ -698,6 +718,15 @@ func printFeatures(items []item) {
 	show("agent reply openings that lean away", replies, 3, 10, false)
 	show("fragments of your turn that lean towards corrections (first 80 characters)", grams, 6, 40, true)
 	show("fragments that lean away", grams, 6, 15, false)
+}
+
+func isASCII(s string) bool {
+	for _, r := range s {
+		if r > 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 func pct(f float64) string {

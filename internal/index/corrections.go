@@ -163,7 +163,7 @@ var correctionTables = []markerTable{
 		[]string{"違う", "違います", "違くて", "ちがう", "ちゃう", "そうじゃな", "そうではな", "いや、", "いや ",
 			"いやいや", "ではなく", "じゃなく", "no,", "no.", "nope", "wrong", "that's wrong", "that is wrong",
 			"that's not", "not what i", "actually,", "нет,", "не так", "неправильно"},
-		[]string{"じゃなくて", "ではなくて", "じゃなく、", "そうじゃない", "そういう意味じゃ", "意味が違", "間違って",
+		[]string{"じゃなくて", "ではなく", "じゃなく、", "そうじゃない", "そういう意味じゃ", "意味が違", "間違って",
 			"間違い", "not what i asked", "that's not what", "неправильно"}},
 	{CorrectionRepeat, nil,
 		[]string{"前も言った", "前にも言った", "さっき言った", "さっきも言った", "何度も言", "何回も言", "何回言",
@@ -193,7 +193,12 @@ var (
 	}
 	apologyMarkers = []string{
 		"申し訳", "すみません", "失礼しました", "失礼いたしました", "ごめんなさい", "おっしゃる通り", "おっしゃるとおり",
-		"ご指摘", "確かに", "誤り", "間違えて", "間違っていました", "勘違い", "見落と", "確認不足", "認識違い",
+		"ご指摘", "確かに", "そのとおりです", "その通りです", "鋭い",
+		// "誤り" and "見落と" alone were 60% and 50% on the labelled run: an
+		// agent also writes "誤りはありません" and "見落としがないか確認します".
+		// Only the forms that admit one count.
+		"誤りでした", "誤っていました", "誤りがありました", "見落としていました", "見落としがありました",
+		"見落としました", "間違えて", "間違っていました", "勘違い", "確認不足", "認識違い",
 		"you're right", "you are right", "you're absolutely right", "you're correct",
 		"sorry", "i apologize", "apologies", "good catch", "my mistake", "i misunderstood", "i was wrong",
 		"извините", "прошу прощения", "вы правы", "ты прав",
