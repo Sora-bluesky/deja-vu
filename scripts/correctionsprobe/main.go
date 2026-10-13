@@ -80,6 +80,7 @@ func main() {
 	n := fs.Int("n", 300, "turns to sample in total")
 	top := fs.Int("top", 20, "highest-scoring accepted turns always included")
 	seed := fs.Int64("seed", 1, "random seed")
+	openings := fs.Bool("openings", false, "stats: also list how agent replies open after a correction marker (prints agent text, not yours)")
 	_ = fs.Parse(os.Args[2:])
 	var err error
 	switch cmd {
@@ -89,6 +90,8 @@ func main() {
 		err = label(*out)
 	case "eval":
 		err = eval(*out)
+	case "stats":
+		err = stats(*openings)
 	default:
 		usage()
 	}
@@ -99,22 +102,28 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: correctionsprobe sample|label|eval [-o file]")
+	fmt.Fprintln(os.Stderr, "usage: correctionsprobe stats|sample|label|eval [-o file]")
 	os.Exit(2)
 }
 
-// sample reads the record log once, rebuilds each session's turn order, and
+// funnel counts where user turns drop out before scoring, so a low yield can
+// be traced to the filter that caused it.
+type funnel struct {
+	userTurns, first, notCandidate, nothingBefore int
+}
+
+// collect reads the record log once, rebuilds each session's turn order, and
 // scores every user turn that has something before it to correct.
-func sample(out string, n, top int, seed int64) error {
-	warnIfInRepo(out)
+func collect() (string, []item, funnel, error) {
+	var f funnel
 	dir := index.DefaultDir()
 	recs, err := index.ReadRecords(dir)
 	if err != nil {
-		return fmt.Errorf("read %s: %w", dir, err)
+		return dir, nil, f, fmt.Errorf("read %s: %w", dir, err)
 	}
 	metas, err := index.AllMeta(dir)
 	if err != nil {
-		return err
+		return dir, nil, f, err
 	}
 	byKey := map[string]index.SessionMeta{}
 	for _, m := range metas {
@@ -139,13 +148,20 @@ func sample(out string, n, top int, seed int64) error {
 			if r.Record.Role != "user" {
 				continue
 			}
+			f.userTurns++
 			first := !sawUser
 			sawUser = true
-			if first || !index.CorrectionCandidate(r.Record.Text) {
+			if first {
+				f.first++
+				continue
+			}
+			if !index.CorrectionCandidate(r.Record.Text) {
+				f.notCandidate++
 				continue
 			}
 			prev, prevCmd, hasBefore := before(rs[:i])
 			if !hasBefore {
+				f.nothingBefore++
 				continue
 			}
 			reply, cmds := after(rs[i+1:])
@@ -159,7 +175,16 @@ func sample(out string, n, top int, seed int64) error {
 		}
 	}
 	if len(all) == 0 {
-		return fmt.Errorf("no candidate turns in %s — is the index built (`deja index`)?", dir)
+		return dir, nil, f, fmt.Errorf("no candidate turns in %s — is the index built (`deja index`)?", dir)
+	}
+	return dir, all, f, nil
+}
+
+func sample(out string, n, top int, seed int64) error {
+	warnIfInRepo(out)
+	dir, all, _, err := collect()
+	if err != nil {
+		return err
 	}
 	var acc, rej []item
 	for _, it := range all {
@@ -584,4 +609,163 @@ func tail(s string, n int) string {
 
 func oneLine(s string) string {
 	return strings.Join(strings.Fields(s), " ")
+}
+
+// stats describes the whole candidate set without sampling or printing any
+// of the person's own text, so the detector can be tuned before anyone spends
+// an hour labelling a sample it would have drawn badly.
+func stats(openings bool) error {
+	dir, all, f, err := collect()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("index %s\n\n== funnel\n", dir)
+	fmt.Printf("  user turns              %7d\n", f.userTurns)
+	fmt.Printf("  - first in session      %7d\n", f.first)
+	fmt.Printf("  - plumbing / length     %7d\n", f.notCandidate)
+	fmt.Printf("  - nothing before        %7d\n", f.nothingBefore)
+	fmt.Printf("  = candidates            %7d\n", len(all))
+
+	count := func(keep func(item) bool) int {
+		n := 0
+		for _, it := range all {
+			if keep(it) {
+				n++
+			}
+		}
+		return n
+	}
+	share := func(n int) string { return fmt.Sprintf("%7d  %5.1f%%", n, 100*float64(n)/float64(len(all))) }
+	fmt.Println("\n== signals over candidates")
+	fmt.Printf("  marker                  %s\n", share(count(func(it item) bool { return it.Marker != "" })))
+	fmt.Printf("  apology                 %s\n", share(count(func(it item) bool { return it.Apology != "" })))
+	fmt.Printf("  normative               %s\n", share(count(func(it item) bool { return it.Norm })))
+	fmt.Printf("  undo                    %s\n", share(count(func(it item) bool { return it.Undo })))
+	fmt.Printf("  anger                   %s\n", share(count(func(it item) bool { return it.Anger > 0 })))
+	fmt.Printf("  no reply after the turn %s\n", share(count(func(it item) bool { return it.Reply == "" })))
+	fmt.Println("\n== combinations")
+	fmt.Printf("  marker + apology        %s\n", share(count(func(it item) bool { return it.Marker != "" && it.Apology != "" })))
+	fmt.Printf("  marker, no apology      %s\n", share(count(func(it item) bool { return it.Marker != "" && it.Apology == "" })))
+	fmt.Printf("    of which normative    %s   ← near misses at score 3\n", share(count(func(it item) bool { return it.Marker != "" && it.Apology == "" && it.Norm })))
+	fmt.Printf("  apology, no marker      %s\n", share(count(func(it item) bool { return it.Marker == "" && it.Apology != "" })))
+	fmt.Printf("  accepted                %s\n", share(count(func(it item) bool { return it.Accepted })))
+
+	scores := map[int]int{}
+	for _, it := range all {
+		scores[it.Score]++
+	}
+	fmt.Println("\n== score")
+	for sc := 0; sc <= 7; sc++ {
+		if scores[sc] > 0 {
+			fmt.Printf("  %d  %7d\n", sc, scores[sc])
+		}
+	}
+
+	type tally struct{ cand, marker, apology, accepted int }
+	byHarness := map[string]*tally{}
+	byMarker := map[string]int{}
+	for _, it := range all {
+		t := byHarness[it.Harness]
+		if t == nil {
+			t = &tally{}
+			byHarness[it.Harness] = t
+		}
+		t.cand++
+		if it.Marker != "" {
+			t.marker++
+			byMarker[it.Marker]++
+		}
+		if it.Apology != "" {
+			t.apology++
+			byMarker["apology:"+it.Apology]++
+		}
+		if it.Accepted {
+			t.accepted++
+		}
+	}
+	fmt.Println("\n== by harness          candidates   marker  apology  accepted")
+	for _, h := range sortedByCount(func(yield func(string, int)) {
+		for k, t := range byHarness {
+			yield(k, t.cand)
+		}
+	}) {
+		t := byHarness[h]
+		fmt.Printf("  %-20s %9d %8d %8d %9d\n", h, t.cand, t.marker, t.apology, t.accepted)
+	}
+	fmt.Println("\n== markers that fired (from the detector's own tables)")
+	for _, k := range sortedByCount(func(yield func(string, int)) {
+		for k, n := range byMarker {
+			yield(k, n)
+		}
+	}) {
+		fmt.Printf("  %-26q %6d\n", k, byMarker[k])
+	}
+
+	if openings {
+		// How agents answer a turn that opened with a correction marker,
+		// against how they answer everything else. An opening that is much
+		// more common after a marker is an acknowledgement phrase the apology
+		// table is missing.
+		after, base := map[string]int{}, map[string]int{}
+		var nAfter, nBase int
+		for _, it := range all {
+			o := opening(it.Reply)
+			if o == "" {
+				continue
+			}
+			if it.Marker != "" {
+				after[o]++
+				nAfter++
+			} else {
+				base[o]++
+				nBase++
+			}
+		}
+		fmt.Println("\n== reply openings after a marker (agent text; lift = how much more common than elsewhere)")
+		fmt.Println("  after  elsewhere   lift  opening")
+		for i, k := range sortedByCount(func(yield func(string, int)) {
+			for k, n := range after {
+				yield(k, n)
+			}
+		}) {
+			if i == 40 || after[k] < 3 {
+				break
+			}
+			lift := (float64(after[k]) / float64(nAfter)) / ((float64(base[k]) + 0.5) / float64(nBase+1))
+			fmt.Printf("  %5d  %9d  %5.1f  %s\n", after[k], base[k], lift, k)
+		}
+	}
+	return nil
+}
+
+// opening is the first few words of a reply, folded so the same
+// acknowledgement compares equal whatever follows it.
+func opening(reply string) string {
+	r := []rune(strings.TrimSpace(reply))
+	for i, c := range r {
+		if c == '\n' || c == '。' || c == '.' || c == '!' || c == '！' || c == ',' || c == '、' {
+			r = r[:i]
+			break
+		}
+	}
+	if len(r) > 16 {
+		r = r[:16]
+	}
+	return strings.ToLower(strings.TrimSpace(string(r)))
+}
+
+func sortedByCount(each func(func(string, int))) []string {
+	counts := map[string]int{}
+	each(func(k string, n int) { counts[k] = n })
+	keys := make([]string, 0, len(counts))
+	for k := range counts {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if counts[keys[i]] != counts[keys[j]] {
+			return counts[keys[i]] > counts[keys[j]]
+		}
+		return keys[i] < keys[j]
+	})
+	return keys
 }
