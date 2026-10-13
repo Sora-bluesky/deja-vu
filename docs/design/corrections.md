@@ -189,7 +189,10 @@ $ deja corrections
    - deja 自身の `corrections` 出力をエージェントが読んだもの → friction の自己学習除外と同様に、出力形式で除外する
    - サブエージェントへのプロンプト（Claude Code の sidechain が user ロールで記録される場合）
      → パーサが sidechain を落としているか**要確認**
-4. **性能**: 1000 セッションの索引で 2 秒以内（`friction` が 1 パス化で 2m46s から縮めた経緯があるので、
+4. **ツール**: `scripts/correctionsprobe`（`sample` → `label` → `eval`）。判定は
+   `internal/index/corrections.go` の `ScoreCorrection` をそのまま使う。sample の出力は既定で
+   `~/deja-corrections-sample.jsonl`（リポジトリの外）。eval は件数と比率しか出さない
+5. **性能**: 1000 セッションの索引で 2 秒以内（`friction` が 1 パス化で 2m46s から縮めた経緯があるので、
    セッション単位の読み直しはしない）
 
 ## 9. 未確定事項
