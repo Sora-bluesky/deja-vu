@@ -81,6 +81,7 @@ func main() {
 	n := fs.Int("n", 300, "turns to sample in total")
 	top := fs.Int("top", 20, "highest-scoring accepted turns always included")
 	seed := fs.Int64("seed", 1, "random seed")
+	features := fs.Bool("features", false, "eval: list what separates corrections from the rest (prints agent reply openings and 2-3 character fragments of your turns)")
 	openings := fs.Bool("openings", false, "stats: also list how agent replies open after a correction marker (prints agent text, not yours)")
 	_ = fs.Parse(os.Args[2:])
 	var err error
@@ -90,7 +91,7 @@ func main() {
 	case "label":
 		err = label(*out)
 	case "eval":
-		err = eval(*out)
+		err = eval(*out, *features)
 	case "stats":
 		err = stats(*openings)
 	default:
@@ -385,8 +386,8 @@ func label(out string) error {
 }
 
 // eval prints only counts and rates, and marker strings from the detector's
-// own tables — nothing from the corpus.
-func eval(out string) error {
+// own tables — nothing from the corpus unless features is set.
+func eval(out string, features bool) error {
 	md, items, err := read(out)
 	if err != nil {
 		return err
@@ -440,6 +441,41 @@ func eval(out string) error {
 		fmt.Printf("  recall                 %5.1f%%   (~%.0f corrections missed)\n", 100*tp/(tp+fn), fn)
 	}
 	fmt.Printf("  kind                   domain %d · workflow %d\n", dom, work)
+
+	// The labels outlive the detector that drew the sample: every labelled
+	// turn still stands for population/labelled turns of its stratum, so a
+	// revised detector can be scored on the same labels without labelling
+	// again. Tuning on one sample overfits it; confirm on a fresh seed.
+	sw := map[string]float64{}
+	for st, t := range per {
+		if n := t.yes + t.no; n > 0 {
+			sw[st] = float64(md.Population[st]) / float64(n)
+		}
+	}
+	verdict := func(name string, accept func(item) bool) {
+		var tp, fp, fn float64
+		for _, it := range items {
+			yes, no := it.Label == "d" || it.Label == "w", it.Label == "n"
+			if !yes && !no {
+				continue
+			}
+			w := sw[it.Stratum]
+			switch {
+			case accept(it) && yes:
+				tp += w
+			case accept(it) && no:
+				fp += w
+			case !accept(it) && yes:
+				fn += w
+			}
+		}
+		prec, rec := tp/math.Max(tp+fp, 1e-9), tp/math.Max(tp+fn, 1e-9)
+		f1 := 2 * prec * rec / math.Max(prec+rec, 1e-9)
+		fmt.Printf("  %-18s accepts ~%5.0f · precision %5.1f%% · recall %5.1f%% · F1 %.2f\n", name, tp+fp, 100*prec, 100*rec, f1)
+	}
+	fmt.Println("\n== detector on these labels (weighted to the index)")
+	verdict("as sampled", func(it item) bool { return it.Accepted })
+	verdict("current code", func(it item) bool { return rescore(it).Accepted })
 
 	// Each labelled turn stands for population/labelled turns of its stratum,
 	// so signal rates describe the index rather than the sample's mix.
@@ -565,7 +601,103 @@ func eval(out string) error {
 		}
 		fmt.Printf("  %-24q  %3d labelled · %5.1f%% corrections\n", k, t.yes+t.no, 100*rate(t))
 	}
+	if features {
+		printFeatures(items)
+	}
 	return nil
+}
+
+// rescore runs the current detector over a labelled turn. The commands that
+// followed it were not kept, only whether one put work back.
+func rescore(it item) index.CorrectionSignals {
+	var cmds []string
+	if it.Undo {
+		cmds = []string{"git restore"}
+	}
+	return index.ScoreCorrection(it.User, it.Reply, cmds)
+}
+
+// printFeatures lists what separates the turns labelled corrections from the
+// rest: how the agent's reply opened, and short fragments of the person's
+// turn. Fragments are two or three characters — enough to find a marker the
+// tables miss, too short to carry what the turn was about.
+func printFeatures(items []item) {
+	type pair struct{ yes, no int }
+	var nYes, nNo int
+	replies := map[string]*pair{}
+	grams := map[string]*pair{}
+	bump := func(m map[string]*pair, k string, yes bool) {
+		p := m[k]
+		if p == nil {
+			p = &pair{}
+			m[k] = p
+		}
+		if yes {
+			p.yes++
+		} else {
+			p.no++
+		}
+	}
+	for _, it := range items {
+		yes, no := it.Label == "d" || it.Label == "w", it.Label == "n"
+		if !yes && !no {
+			continue
+		}
+		if yes {
+			nYes++
+		} else {
+			nNo++
+		}
+		if o := opening(it.Reply); o != "" {
+			bump(replies, o, yes)
+		}
+		r := []rune(strings.ToLower(strings.TrimSpace(it.User)))
+		if len(r) > 80 {
+			r = r[:80]
+		}
+		seen := map[string]bool{}
+		for size := 2; size <= 3; size++ {
+			for i := 0; i+size <= len(r); i++ {
+				g := string(r[i : i+size])
+				if strings.ContainsAny(g, " \t\n、。，．,.") || seen[g] {
+					continue
+				}
+				seen[g] = true
+				bump(grams, g, yes)
+			}
+		}
+	}
+	logOdds := func(p *pair) float64 {
+		return math.Log((float64(p.yes) + 0.5) / float64(nYes+1) / ((float64(p.no) + 0.5) / float64(nNo+1)))
+	}
+	show := func(title string, m map[string]*pair, minSupport, limit int, positive bool) {
+		var keys []string
+		for k, p := range m {
+			if p.yes+p.no >= minSupport && (logOdds(p) > 0) == positive {
+				keys = append(keys, k)
+			}
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			a, b := logOdds(m[keys[i]]), logOdds(m[keys[j]])
+			if a != b {
+				return (a > b) == positive
+			}
+			return keys[i] < keys[j]
+		})
+		if len(keys) > limit {
+			keys = keys[:limit]
+		}
+		fmt.Printf("\n== %s\n  corrections  others  log-odds  text\n", title)
+		for _, k := range keys {
+			p := m[k]
+			fmt.Printf("  %11d  %6d  %8.2f  %q\n", p.yes, p.no, logOdds(p), k)
+		}
+	}
+	fmt.Printf("\n(features over %d corrections and %d others, unweighted)\n", nYes, nNo)
+	show("agent reply openings that lean towards corrections", replies, 3, 25, true)
+	show("agent reply openings that lean away", replies, 3, 10, false)
+	show("fragments of your turn that lean towards corrections (first 80 characters)", grams, 6, 40, true)
+	show("fragments that lean away", grams, 6, 15, false)
 }
 
 func pct(f float64) string {

@@ -79,7 +79,7 @@ const (
 
 var CorrectionKindWeight = map[string]int{
 	CorrectionNegation: 3, CorrectionRepeat: 3, CorrectionUnasked: 3,
-	CorrectionNotFixed: 2, CorrectionUndo: 2, CorrectionWhy: 1,
+	CorrectionNotFixed: 2, CorrectionUndo: 1, CorrectionWhy: 1,
 }
 
 // CorrectionReject says why a user turn cannot be a correction at all —
@@ -170,7 +170,9 @@ var correctionTables = []markerTable{
 			"言ったよね", "言ったでしょ", "言ったのに", "また同じ", "i said", "i told you", "i already told",
 			"as i said", "я же говорил", "я говорил"}},
 	{CorrectionUnasked,
-		[]string{"don't", "do not", "stop,", "stop.", "why did you"},
+		// "stop." and "stop," were 0 of 2 on the first labelled run: an
+		// operator session telling a worker to halt, not a correction.
+		[]string{"don't", "do not", "why did you"},
 		[]string{"勝手に", "頼んでない", "頼んでいない", "求めてない", "余計な", "しなくていい", "しなくて良い",
 			"いらない", "不要です", "やめて", "i didn't ask", "no need to", "stop doing", "зачем"}},
 	{CorrectionNotFixed, nil,
