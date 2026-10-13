@@ -108,103 +108,23 @@ func usage() {
 	os.Exit(2)
 }
 
-// funnel counts where user turns drop out before scoring, so a low yield can
-// be traced to the filter that caused it.
-type funnel struct {
-	userTurns, first, plumbing, short, long, automated, nothingBefore int
-}
-
-// automatedSessions is how many separate sessions the same user text must
-// appear in before it is taken for a scripted prompt rather than a person:
-// the first real run had one instruction, sent verbatim by a loop, as the
-// most frequent "correction".
-const automatedSessions = 5
-
-// collect reads the record log once, rebuilds each session's turn order, and
-// scores every user turn that has something before it to correct.
-func collect() (string, []item, funnel, error) {
-	var f funnel
+// collect is the production scan, so what is measured here is what
+// `deja corrections` runs.
+func collect() (string, []item, index.CorrectionFunnel, error) {
 	dir := index.DefaultDir()
-	recs, err := index.ReadRecords(dir)
+	turns, f, err := index.ScanCorrections(dir)
 	if err != nil {
 		return dir, nil, f, fmt.Errorf("read %s: %w", dir, err)
 	}
-	metas, err := index.AllMeta(dir)
-	if err != nil {
-		return dir, nil, f, err
-	}
-	byKey := map[string]index.SessionMeta{}
-	for _, m := range metas {
-		byKey[m.Harness+":"+m.ID] = m
-	}
-	// A session is written in message order, and an incremental update
-	// rewrites a changed session whole, so offset order within a key is turn
-	// order. Records of different sessions can interleave; grouping undoes it.
-	sessions := map[string][]index.OffsetRecord{}
-	for _, r := range recs {
-		switch r.Record.Role {
-		case "user", "assistant", "tool-output", "command":
-			sessions[r.Record.Key] = append(sessions[r.Record.Key], r)
-		}
-	}
-	seenIn := map[string]map[string]bool{}
-	for key, rs := range sessions {
-		for _, r := range rs {
-			if r.Record.Role != "user" {
-				continue
-			}
-			t := strings.TrimSpace(r.Record.Text)
-			if seenIn[t] == nil {
-				seenIn[t] = map[string]bool{}
-			}
-			seenIn[t][key] = true
-		}
-	}
-	var all []item
-	for key, rs := range sessions {
-		sort.Slice(rs, func(i, j int) bool { return rs[i].Offset < rs[j].Offset })
-		m := byKey[key]
-		sawUser := false
-		for i, r := range rs {
-			if r.Record.Role != "user" {
-				continue
-			}
-			f.userTurns++
-			first := !sawUser
-			sawUser = true
-			if first {
-				f.first++
-				continue
-			}
-			switch index.CorrectionReject(r.Record.Text) {
-			case "plumbing":
-				f.plumbing++
-				continue
-			case "short":
-				f.short++
-				continue
-			case "long":
-				f.long++
-				continue
-			}
-			if len(seenIn[strings.TrimSpace(r.Record.Text)]) >= automatedSessions {
-				f.automated++
-				continue
-			}
-			prev, prevCmd, hasBefore := before(rs[:i])
-			if !hasBefore {
-				f.nothingBefore++
-				continue
-			}
-			reply, cmds := after(rs[i+1:])
-			s := index.ScoreCorrection(r.Record.Text, reply, cmds)
-			all = append(all, item{
-				Harness: m.Harness, Project: m.Project, Time: r.Record.Time,
-				Prev: tail(prev, 300), PrevCmd: tail(prevCmd, 160), User: r.Record.Text, Reply: head(reply, 300),
-				Kind: s.Kind, Marker: s.Marker, Apology: s.Apology, Norm: s.Normative, Undo: s.Undo, Anger: s.Anger,
-				Score: s.Score, Accepted: s.Accepted,
-			})
-		}
+	all := make([]item, 0, len(turns))
+	for _, t := range turns {
+		s := t.Signals
+		all = append(all, item{
+			Harness: t.Session.Harness, Project: t.Session.Project, Time: t.Time,
+			Prev: t.Prev, PrevCmd: t.PrevCmd, User: t.User, Reply: t.Reply,
+			Kind: s.Kind, Marker: s.Marker, Apology: s.Apology, Norm: s.Normative, Undo: s.Undo, Anger: s.Anger,
+			Score: s.Score, Accepted: s.Accepted,
+		})
 	}
 	if len(all) == 0 {
 		return dir, nil, f, fmt.Errorf("no candidate turns in %s — is the index built (`deja index`)?", dir)
@@ -275,43 +195,6 @@ func sample(out string, n, top int, seed int64) error {
 	fmt.Printf("sampled %d (top %d · accepted %d · rejected %d) → %s\n", len(picked), top, nAcc, nRej, out)
 	fmt.Println("next: correctionsprobe label")
 	return nil
-}
-
-// before returns the nearest agent reply and command before a turn, and
-// whether anything at all came before it to correct.
-func before(rs []index.OffsetRecord) (reply, cmd string, ok bool) {
-	for i := len(rs) - 1; i >= 0; i-- {
-		r := rs[i].Record
-		if r.Role == "user" {
-			break
-		}
-		ok = true
-		if r.Role == "assistant" && reply == "" {
-			reply = r.Text
-		}
-		if r.Role == "command" && cmd == "" {
-			cmd = r.Text
-		}
-	}
-	return reply, cmd, ok
-}
-
-// after returns the agent's first reply and every command up to the next
-// user turn.
-func after(rs []index.OffsetRecord) (reply string, cmds []string) {
-	for _, r := range rs {
-		switch r.Record.Role {
-		case "user":
-			return reply, cmds
-		case "assistant":
-			if reply == "" {
-				reply = r.Record.Text
-			}
-		case "command":
-			cmds = append(cmds, r.Record.Text)
-		}
-	}
-	return reply, cmds
 }
 
 func draw(rng *rand.Rand, from []item, k int) []item {
@@ -842,13 +725,13 @@ func stats(openings bool) error {
 		return err
 	}
 	fmt.Printf("index %s\n\n== funnel\n", dir)
-	fmt.Printf("  user turns              %7d\n", f.userTurns)
-	fmt.Printf("  - first in session      %7d\n", f.first)
-	fmt.Printf("  - plumbing              %7d\n", f.plumbing)
-	fmt.Printf("  - too short             %7d\n", f.short)
-	fmt.Printf("  - too long              %7d\n", f.long)
-	fmt.Printf("  - same text in %d+ sess. %7d\n", automatedSessions, f.automated)
-	fmt.Printf("  - nothing before        %7d\n", f.nothingBefore)
+	fmt.Printf("  user turns              %7d\n", f.UserTurns)
+	fmt.Printf("  - first in session      %7d\n", f.First)
+	fmt.Printf("  - plumbing              %7d\n", f.Plumbing)
+	fmt.Printf("  - too short             %7d\n", f.Short)
+	fmt.Printf("  - too long              %7d\n", f.Long)
+	fmt.Printf("  - same text in %d+ sess. %7d\n", index.CorrectionAutomatedSessions, f.Automated)
+	fmt.Printf("  - nothing before        %7d\n", f.NothingBefore)
 	fmt.Printf("  = candidates            %7d\n", len(all))
 
 	count := func(keep func(item) bool) int {

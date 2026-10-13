@@ -304,3 +304,44 @@ func angerLevel(text string) int {
 	}
 	return n
 }
+
+// CorrectionShingles is what two corrections are compared on to tell whether
+// they say the same thing: character pairs for Japanese and Chinese, the way
+// the index tokenises them, and lowercased words otherwise. What every
+// correction shares is taken out first — the marker phrases ("じゃなくて")
+// and pairs of hiragana alone, which are grammar — because left in they made
+// "use bun" and "use go test" look half alike. Only the opening is used, the
+// part that says what was wrong.
+func CorrectionShingles(text string) map[string]bool {
+	t := strings.ToLower(headRunes(strings.TrimSpace(text), 200))
+	for _, tbl := range correctionTables {
+		for _, m := range append(append([]string{}, tbl.prefix...), tbl.anywhere...) {
+			if !isASCIIString(m) {
+				t = strings.ReplaceAll(t, m, " ")
+			}
+		}
+	}
+	out := map[string]bool{}
+	for _, b := range cjkBigrams(t) {
+		if len([]rune(b)) == 2 && !cjkFunctionBigram(b) && !allHiragana(b) {
+			out[b] = true
+		}
+	}
+	for _, w := range strings.FieldsFunc(t, func(r rune) bool {
+		return !(unicode.IsLetter(r) || unicode.IsDigit(r)) || r > unicode.MaxASCII
+	}) {
+		if len(w) >= 3 {
+			out[w] = true
+		}
+	}
+	return out
+}
+
+func allHiragana(s string) bool {
+	for _, r := range s {
+		if !unicode.Is(unicode.Hiragana, r) {
+			return false
+		}
+	}
+	return true
+}
