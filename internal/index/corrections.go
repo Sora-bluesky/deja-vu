@@ -172,7 +172,10 @@ var correctionTables = []markerTable{
 		[]string{"違う", "違います", "違くて", "ちがう", "ちゃう", "そうじゃな", "そうではな", "いや、", "いや ",
 			"いやいや", "ではなく", "じゃなく", "no,", "no.", "nope", "wrong", "that's wrong", "that is wrong",
 			"that's not", "not what i", "actually,", "нет,", "не так", "неправильно"},
-		[]string{"じゃなくて", "ではなく", "じゃなく、", "そうじゃない", "そういう意味じゃ", "意味が違", "間違って",
+		// "ではなく" anywhere was added from fragments of the first labelled
+		// sample, where one turn sampled seven times carried it; on a fresh
+		// sample it was a correction in 11 of 23 turns.
+		[]string{"じゃなくて", "ではなくて", "じゃなく、", "そうじゃない", "そういう意味じゃ", "意味が違", "間違って",
 			"間違い", "not what i asked", "that's not what", "неправильно"}},
 	{CorrectionRepeat, nil,
 		[]string{"前も言った", "前にも言った", "さっき言った", "さっきも言った", "何度も言", "何回も言", "何回言",
