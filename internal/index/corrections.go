@@ -39,8 +39,7 @@ type CorrectionSignals struct {
 	// wrote is worth keeping.
 	Anger int
 	Score int
-	// Accepted is the verdict: the agent acknowledged a mistake, or the turn
-	// said outright that it made one.
+	// Accepted is the verdict: the agent's next reply acknowledged a mistake.
 	Accepted bool
 }
 
@@ -143,18 +142,13 @@ func ScoreCorrection(user, reply string, commands []string) CorrectionSignals {
 	if s.Undo {
 		s.Score += CorrectionWeightUndo
 	}
-	// Measured on 300 labelled turns, the score threshold and this rule
-	// accepted the same turns (precision 86%, recall 14%); the rule is the
-	// one a person can check by reading the turn. The score still ranks.
-	s.Accepted = s.Apology != "" || strongCorrection(s.Kind)
+	// Only the agent's acknowledgement held up on a fresh sample: 90% on the
+	// 300 turns the tables were tuned on and 82% on 100 new ones, where the
+	// person's own markers fell to 40%. People correct an agent in their own
+	// words; agents concede in a few stock phrases. Markers still rank and
+	// name the kind, they do not decide.
+	s.Accepted = s.Apology != ""
 	return s
-}
-
-// strongCorrection reports the kinds that say outright the agent got it
-// wrong. Weaker kinds — still broken, put it back, why — were right about
-// half the time and need the agent to acknowledge the turn as well.
-func strongCorrection(kind string) bool {
-	return kind == CorrectionNegation || kind == CorrectionRepeat || kind == CorrectionUnasked
 }
 
 type markerTable struct {
@@ -205,7 +199,9 @@ var (
 	}
 	apologyMarkers = []string{
 		"申し訳", "すみません", "失礼しました", "失礼いたしました", "ごめんなさい", "おっしゃる通り", "おっしゃるとおり",
-		"ご指摘", "確かに", "そのとおりです", "その通りです", "鋭い",
+		// "鋭い" was added from the tuning sample and was a correction in 1
+		// of 4 fresh turns: agents also call a question "鋭い観点".
+		"ご指摘", "確かに", "そのとおりです", "その通りです",
 		// "誤り" and "見落と" alone were 60% and 50% on the labelled run: an
 		// agent also writes "誤りはありません" and "見落としがないか確認します".
 		// Only the forms that admit one count.
