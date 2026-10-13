@@ -21,12 +21,14 @@ import (
 
 // CorrectionSignals is what one user turn showed.
 type CorrectionSignals struct {
-	// Marker is the correction phrase the turn opened with or contained, from
-	// the tables below; "" when none matched.
+	// Kind and Marker are the kind of correction and the phrase that showed
+	// it, from the tables below; both "" when none matched.
+	Kind   string
 	Marker string
 	// Apology is the acknowledgement the agent's next reply opened with. It is
 	// weighted highest: people phrase a correction a hundred ways, agents
-	// answer one in very few.
+	// answer one in few. Measured on one store, current models rarely say
+	// sorry — "ご指摘ありがとうございます" outnumbered "申し訳" thirty to one.
 	Apology string
 	// Normative reports an instruction in the turn — use, don't, always.
 	Normative bool
@@ -43,39 +45,86 @@ type CorrectionSignals struct {
 }
 
 const (
-	CorrectionWeightMarker    = 2
 	CorrectionWeightApology   = 3
 	CorrectionWeightNormative = 1
 	CorrectionWeightUndo      = 1
-	CorrectionMinScore        = 4
+	CorrectionMinScore        = 3
 
-	correctionMinRunes = 8
-	// A correction is written in the moment. A turn longer than this is a
-	// pasted log or a spec, and shown cut off on a screen it reads as noise.
-	correctionMaxRunes = 400
+	// "違う、bun" is four runes and a whole correction.
+	correctionMinRunes = 4
+	// Corrections come with context more often than not; the first run cut
+	// at 400 runes and dropped two thirds of all user turns. Past this length
+	// a turn is a pasted log or a spec.
+	correctionMaxRunes = 1000
+	// The markers are looked for in the opening of the turn: a correction
+	// says so first, and a "違う" in the eighth paragraph of a spec is quoted.
+	correctionHeadRunes = 300
 	// How much of the reply is searched for the acknowledgement: agents put it
 	// first, and a "sorry" three paragraphs down is about something else.
 	correctionApologyRunes = 160
 )
 
-// CorrectionCandidate reports whether a user turn is the kind that could be a
-// correction at all. Session context — that something came before it to
-// correct — is the caller's to check.
-func CorrectionCandidate(text string) bool {
+// Correction kinds, with what a marker of each kind adds to the score. The
+// three that say outright the agent got it wrong are enough on their own; a
+// report that something is still broken, or a request to put work back, is a
+// correction of a claim rather than of knowledge and needs one more signal.
+const (
+	CorrectionNegation = "negation"
+	CorrectionRepeat   = "repeat"
+	CorrectionUnasked  = "unasked"
+	CorrectionNotFixed = "not-fixed"
+	CorrectionUndo     = "undo"
+	CorrectionWhy      = "why"
+)
+
+var CorrectionKindWeight = map[string]int{
+	CorrectionNegation: 3, CorrectionRepeat: 3, CorrectionUnasked: 3,
+	CorrectionNotFixed: 2, CorrectionUndo: 2, CorrectionWhy: 1,
+}
+
+// CorrectionReject says why a user turn cannot be a correction at all —
+// "plumbing", "short", "long" — or "" when it can. Session context — that
+// something came before it to correct — is the caller's to check.
+func CorrectionReject(text string) string {
 	t := strings.TrimSpace(text)
-	if notAsked(t) {
-		return false
+	if notAsked(t) || correctionPlumbing(t) {
+		return "plumbing"
 	}
 	n := len([]rune(t))
-	return n >= correctionMinRunes && n <= correctionMaxRunes
+	switch {
+	case n < correctionMinRunes:
+		return "short"
+	case n > correctionMaxRunes:
+		return "long"
+	}
+	return ""
+}
+
+// CorrectionCandidate reports whether a user turn could be a correction.
+func CorrectionCandidate(text string) bool { return CorrectionReject(text) == "" }
+
+// correctionPlumbing covers what harnesses write under the user role that
+// notAsked does not need to know about. "Stop hook feedback:" was the most
+// frequent marker hit on the first real run, all of it a hook talking.
+func correctionPlumbing(t string) bool {
+	low := strings.ToLower(t)
+	for _, p := range []string{
+		"stop hook feedback", "pretooluse", "posttooluse", "hook ", "base directory for this skill",
+		"<", "[image", "[pasted",
+	} {
+		if strings.HasPrefix(low, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // ScoreCorrection scores a user turn given the agent's next reply and the
 // commands that ran before the next user turn.
 func ScoreCorrection(user, reply string, commands []string) CorrectionSignals {
 	var s CorrectionSignals
-	low := strings.ToLower(strings.TrimSpace(user))
-	s.Marker = correctionMarker(low)
+	low := strings.ToLower(headRunes(strings.TrimSpace(user), correctionHeadRunes))
+	s.Kind, s.Marker = correctionMarker(low)
 	s.Apology = apologyMarker(reply)
 	s.Normative = hasAny(low, normativeMarkers)
 	for _, c := range commands {
@@ -85,9 +134,7 @@ func ScoreCorrection(user, reply string, commands []string) CorrectionSignals {
 		}
 	}
 	s.Anger = angerLevel(user)
-	if s.Marker != "" {
-		s.Score += CorrectionWeightMarker
-	}
+	s.Score += CorrectionKindWeight[s.Kind]
 	if s.Apology != "" {
 		s.Score += CorrectionWeightApology
 	}
@@ -101,36 +148,52 @@ func ScoreCorrection(user, reply string, commands []string) CorrectionSignals {
 	return s
 }
 
+type markerTable struct {
+	kind             string
+	prefix, anywhere []string
+}
+
 // The marker tables cover the languages deja already handles: Japanese,
 // English, Russian. Prefix markers only count at the start of the turn,
 // because "だから" or "stop" mid-sentence is ordinary prose; anywhere markers
-// are specific enough to count wherever they are.
+// are specific enough to count wherever they are in the opening. Order
+// matters: the first kind that matches names the turn.
+var correctionTables = []markerTable{
+	{CorrectionNegation,
+		[]string{"違う", "違います", "違くて", "ちがう", "ちゃう", "そうじゃな", "そうではな", "いや、", "いや ",
+			"いやいや", "ではなく", "じゃなく", "no,", "no.", "nope", "wrong", "that's wrong", "that is wrong",
+			"that's not", "not what i", "actually,", "нет,", "не так", "неправильно"},
+		[]string{"じゃなくて", "ではなくて", "じゃなく、", "そうじゃない", "そういう意味じゃ", "意味が違", "間違って",
+			"間違い", "not what i asked", "that's not what", "неправильно"}},
+	{CorrectionRepeat, nil,
+		[]string{"前も言った", "前にも言った", "さっき言った", "さっきも言った", "何度も言", "何回も言", "何回言",
+			"言ったよね", "言ったでしょ", "言ったのに", "また同じ", "i said", "i told you", "i already told",
+			"as i said", "я же говорил", "я говорил"}},
+	{CorrectionUnasked,
+		[]string{"don't", "do not", "stop,", "stop.", "why did you"},
+		[]string{"勝手に", "頼んでない", "頼んでいない", "求めてない", "余計な", "しなくていい", "しなくて良い",
+			"いらない", "不要です", "やめて", "i didn't ask", "no need to", "stop doing", "зачем"}},
+	{CorrectionNotFixed, nil,
+		[]string{"直ってない", "直っていない", "治ってない", "変わってない", "変わっていない", "反映されてない",
+			"反映されていない", "動かない", "動いてない", "できてない", "できていない", "まだ同じ",
+			"still broken", "still not", "doesn't work", "didn't work", "not working", "still failing"}},
+	{CorrectionUndo, nil,
+		[]string{"戻して", "元に戻", "やり直", "revert", "undo", "верни", "откати"}},
+	{CorrectionWhy,
+		[]string{"なんで", "何で", "なぜ", "どうして", "why are you", "why is"}, nil},
+}
+
 var (
-	correctionPrefixMarkers = []string{
-		"違う", "違います", "違くて", "ちがう", "ちゃう", "そうじゃなく", "そうではなく",
-		"いや、", "いや ", "いやいや", "だから", "なんで", "何で", "ではなく",
-		"no,", "no.", "no ", "nope", "wrong", "that's wrong", "that is wrong",
-		"that's not", "not what i", "actually,", "wait,", "stop", "don't", "do not",
-		"why did you", "why are you",
-		"нет,", "нет ", "не так", "неправильно", "стоп", "зачем",
-	}
-	correctionAnywhereMarkers = []string{
-		"じゃなくて", "ではなくて", "前も言った", "前にも言った", "さっき言った", "さっきも言った",
-		"何度も", "何回も", "何回言", "勝手に", "戻して", "元に戻", "言ったよね", "言ったでしょ",
-		"って言った", "余計な",
-		"i said", "i told you", "i already told", "as i said", "not what i asked",
-		"you broke", "revert", "undo",
-		"я же говорил", "я говорил", "верни", "откати",
-	}
 	// Phrases a prefix marker would otherwise catch that are thanks or
 	// agreement, not correction.
 	correctionPrefixExceptions = []string{
 		"no problem", "no worries", "いやー", "いやあ", "いやぁ",
 	}
 	apologyMarkers = []string{
-		"申し訳", "すみません", "失礼しました", "おっしゃる通り", "おっしゃるとおり", "ご指摘", "確かに",
+		"申し訳", "すみません", "失礼しました", "失礼いたしました", "ごめんなさい", "おっしゃる通り", "おっしゃるとおり",
+		"ご指摘", "確かに", "誤り", "間違えて", "間違っていました", "勘違い", "見落と", "確認不足", "認識違い",
 		"you're right", "you are right", "you're absolutely right", "you're correct",
-		"sorry", "i apologize", "apologies", "good catch", "my mistake", "i misunderstood",
+		"sorry", "i apologize", "apologies", "good catch", "my mistake", "i misunderstood", "i was wrong",
 		"извините", "прошу прощения", "вы правы", "ты прав",
 	}
 	normativeMarkers = []string{
@@ -147,36 +210,42 @@ var (
 	}
 )
 
-func correctionMarker(low string) string {
+func correctionMarker(low string) (kind, marker string) {
 	low = strings.TrimLeft(low, " \t\"'「『")
+	prefixOK := true
 	for _, ex := range correctionPrefixExceptions {
 		if strings.HasPrefix(low, ex) {
-			return anywhereMarker(low)
+			prefixOK = false
+			break
 		}
 	}
-	for _, m := range correctionPrefixMarkers {
-		if strings.HasPrefix(low, m) {
-			return m
+	for _, t := range correctionTables {
+		if prefixOK {
+			for _, m := range t.prefix {
+				if strings.HasPrefix(low, m) {
+					return t.kind, m
+				}
+			}
+		}
+		for _, m := range t.anywhere {
+			if strings.Contains(low, m) {
+				return t.kind, m
+			}
 		}
 	}
-	return anywhereMarker(low)
+	return "", ""
 }
 
-func anywhereMarker(low string) string {
-	for _, m := range correctionAnywhereMarkers {
-		if strings.Contains(low, m) {
-			return m
-		}
+func headRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) > n {
+		return string(r[:n])
 	}
-	return ""
+	return s
 }
 
 func apologyMarker(reply string) string {
-	r := []rune(strings.TrimSpace(reply))
-	if len(r) > correctionApologyRunes {
-		r = r[:correctionApologyRunes]
-	}
-	low := strings.ToLower(string(r))
+	low := strings.ToLower(headRunes(strings.TrimSpace(reply), correctionApologyRunes))
 	for _, m := range apologyMarkers {
 		if strings.Contains(low, m) {
 			return m

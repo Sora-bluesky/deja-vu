@@ -57,6 +57,7 @@ type item struct {
 	PrevCmd  string    `json:"prev_cmd,omitempty"`
 	User     string    `json:"user"`
 	Reply    string    `json:"reply"`
+	Kind     string    `json:"kind,omitempty"`
 	Marker   string    `json:"marker,omitempty"`
 	Apology  string    `json:"apology,omitempty"`
 	Norm     bool      `json:"normative,omitempty"`
@@ -109,8 +110,14 @@ func usage() {
 // funnel counts where user turns drop out before scoring, so a low yield can
 // be traced to the filter that caused it.
 type funnel struct {
-	userTurns, first, notCandidate, nothingBefore int
+	userTurns, first, plumbing, short, long, automated, nothingBefore int
 }
+
+// automatedSessions is how many separate sessions the same user text must
+// appear in before it is taken for a scripted prompt rather than a person:
+// the first real run had one instruction, sent verbatim by a loop, as the
+// most frequent "correction".
+const automatedSessions = 5
 
 // collect reads the record log once, rebuilds each session's turn order, and
 // scores every user turn that has something before it to correct.
@@ -139,6 +146,19 @@ func collect() (string, []item, funnel, error) {
 			sessions[r.Record.Key] = append(sessions[r.Record.Key], r)
 		}
 	}
+	seenIn := map[string]map[string]bool{}
+	for key, rs := range sessions {
+		for _, r := range rs {
+			if r.Record.Role != "user" {
+				continue
+			}
+			t := strings.TrimSpace(r.Record.Text)
+			if seenIn[t] == nil {
+				seenIn[t] = map[string]bool{}
+			}
+			seenIn[t][key] = true
+		}
+	}
 	var all []item
 	for key, rs := range sessions {
 		sort.Slice(rs, func(i, j int) bool { return rs[i].Offset < rs[j].Offset })
@@ -155,8 +175,19 @@ func collect() (string, []item, funnel, error) {
 				f.first++
 				continue
 			}
-			if !index.CorrectionCandidate(r.Record.Text) {
-				f.notCandidate++
+			switch index.CorrectionReject(r.Record.Text) {
+			case "plumbing":
+				f.plumbing++
+				continue
+			case "short":
+				f.short++
+				continue
+			case "long":
+				f.long++
+				continue
+			}
+			if len(seenIn[strings.TrimSpace(r.Record.Text)]) >= automatedSessions {
+				f.automated++
 				continue
 			}
 			prev, prevCmd, hasBefore := before(rs[:i])
@@ -169,7 +200,7 @@ func collect() (string, []item, funnel, error) {
 			all = append(all, item{
 				Harness: m.Harness, Project: m.Project, Time: r.Record.Time,
 				Prev: tail(prev, 300), PrevCmd: tail(prevCmd, 160), User: r.Record.Text, Reply: head(reply, 300),
-				Marker: s.Marker, Apology: s.Apology, Norm: s.Normative, Undo: s.Undo, Anger: s.Anger,
+				Kind: s.Kind, Marker: s.Marker, Apology: s.Apology, Norm: s.Normative, Undo: s.Undo, Anger: s.Anger,
 				Score: s.Score, Accepted: s.Accepted,
 			})
 		}
@@ -439,7 +470,7 @@ func eval(out string) error {
 	}
 	fmt.Println("\n== signals (weighted to the index)")
 	fmt.Println("  signal      labelled  corrections  log-likelihood ratio  current weight")
-	current := map[string]int{"marker": index.CorrectionWeightMarker, "apology": index.CorrectionWeightApology,
+	current := map[string]int{"apology": index.CorrectionWeightApology,
 		"normative": index.CorrectionWeightNormative, "undo": index.CorrectionWeightUndo}
 	for _, s := range sigs {
 		var yes, no float64
@@ -461,15 +492,45 @@ func eval(out string) error {
 		cw := "—"
 		if w, ok := current[s.name]; ok {
 			cw = fmt.Sprint(w)
+		} else if s.name == "marker" {
+			cw = "by kind"
 		}
 		fmt.Printf("  %-10s  %8d  %10.1f%%  %20.2f  %14s\n", s.name, n, 100*yes/math.Max(yes+no, 1e-9), llr, cw)
 	}
 	fmt.Println("  (a positive ratio means the signal points at a correction; compare its size across signals)")
 
+	byKind := map[string]*tally{}
+	for _, it := range items {
+		k := it.Kind
+		if k == "" {
+			k = "(none)"
+		}
+		t := byKind[k]
+		if t == nil {
+			t = &tally{}
+			byKind[k] = t
+		}
+		switch it.Label {
+		case "d", "w":
+			t.yes++
+		case "n":
+			t.no++
+		}
+	}
+	fmt.Println("\n== marker kinds (unweighted)")
+	for _, k := range []string{index.CorrectionNegation, index.CorrectionRepeat, index.CorrectionUnasked,
+		index.CorrectionNotFixed, index.CorrectionUndo, index.CorrectionWhy, "(none)"} {
+		t := byKind[k]
+		if t == nil || t.yes+t.no == 0 {
+			continue
+		}
+		fmt.Printf("  %-10s  weight %d  %3d labelled · %s corrections\n", k, index.CorrectionKindWeight[k], t.yes+t.no, pct(rate(t)))
+	}
+
 	byMarker := map[string]*tally{}
 	for _, it := range items {
-		for _, m := range []string{it.Marker, "apology:" + it.Apology} {
-			if m == "" || m == "apology:" {
+		for _, m := range []string{it.Kind + ":" + it.Marker, "apology:" + it.Apology} {
+			if m == ":" || m == "apology:" {
 				continue
 			}
 			t := byMarker[m]
@@ -622,7 +683,10 @@ func stats(openings bool) error {
 	fmt.Printf("index %s\n\n== funnel\n", dir)
 	fmt.Printf("  user turns              %7d\n", f.userTurns)
 	fmt.Printf("  - first in session      %7d\n", f.first)
-	fmt.Printf("  - plumbing / length     %7d\n", f.notCandidate)
+	fmt.Printf("  - plumbing              %7d\n", f.plumbing)
+	fmt.Printf("  - too short             %7d\n", f.short)
+	fmt.Printf("  - too long              %7d\n", f.long)
+	fmt.Printf("  - same text in %d+ sess. %7d\n", automatedSessions, f.automated)
 	fmt.Printf("  - nothing before        %7d\n", f.nothingBefore)
 	fmt.Printf("  = candidates            %7d\n", len(all))
 
@@ -646,7 +710,7 @@ func stats(openings bool) error {
 	fmt.Println("\n== combinations")
 	fmt.Printf("  marker + apology        %s\n", share(count(func(it item) bool { return it.Marker != "" && it.Apology != "" })))
 	fmt.Printf("  marker, no apology      %s\n", share(count(func(it item) bool { return it.Marker != "" && it.Apology == "" })))
-	fmt.Printf("    of which normative    %s   ← near misses at score 3\n", share(count(func(it item) bool { return it.Marker != "" && it.Apology == "" && it.Norm })))
+	fmt.Printf("    of which normative    %s\n", share(count(func(it item) bool { return it.Marker != "" && it.Apology == "" && it.Norm })))
 	fmt.Printf("  apology, no marker      %s\n", share(count(func(it item) bool { return it.Marker == "" && it.Apology != "" })))
 	fmt.Printf("  accepted                %s\n", share(count(func(it item) bool { return it.Accepted })))
 
@@ -673,7 +737,7 @@ func stats(openings bool) error {
 		t.cand++
 		if it.Marker != "" {
 			t.marker++
-			byMarker[it.Marker]++
+			byMarker[it.Kind+":"+it.Marker]++
 		}
 		if it.Apology != "" {
 			t.apology++
