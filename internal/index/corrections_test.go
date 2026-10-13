@@ -18,7 +18,8 @@ func TestScoreCorrection(t *testing.T) {
 		{"negation alone is enough", "そうじゃなくて、テストは go test ./... -race で回して", "go test を実行します。", nil, true},
 		{"current models thank instead of apologising", "テストは make test でお願い", "ご指摘ありがとうございます。make test で実行します。", nil, true},
 		{"not fixed needs one more signal", "まだ直ってない", "確認します。", nil, false},
-		{"not fixed with an instruction", "直ってない、キャッシュを消してから試して", "確認します。", nil, true},
+		{"not fixed with an instruction is still weak", "直ってない、キャッシュを消してから試して", "確認します。", nil, false},
+		{"not fixed, acknowledged", "直ってない、キャッシュを消してから試して", "ご指摘のとおりです。キャッシュを消します。", nil, true},
 		{"marker, instruction and undo", "勝手に消さないで、戻して", "了解です。", []string{"git restore main.go"}, true},
 		{"apology with instruction", "テストは make test じゃなくて go test でやって", "失礼しました。go test で実行します。", nil, true},
 		// The false positives the design names.
