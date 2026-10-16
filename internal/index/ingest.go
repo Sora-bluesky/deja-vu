@@ -282,6 +282,10 @@ func Ensure(dir string, harness string, force bool, progress io.Writer) error {
 		return err
 	}
 	defer unlock()
+	return ensureHeld(dir, harness, force, progress)
+}
+
+func ensureHeld(dir string, harness string, force bool, progress io.Writer) error {
 	sweepStaleTmp(dir)
 	// The manifest is read before the walk so unchanged files can carry
 	// their derived state forward instead of being re-read.
