@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode"
@@ -2786,7 +2787,7 @@ func findByPrefix(dir, p string) (model.Session, bool, error) {
 		}
 	}
 	if err := ensureForCLIRead(dir); err == nil {
-		if s, ok, err := index.FindByPrefix(dir, p); err == nil {
+		if s, ok, err := lookupUnlessNew(dir, func() (model.Session, bool, error) { return index.FindByPrefix(dir, p) }); err == nil {
 			if ok {
 				noteForgottenSource(s, p, true)
 			}
@@ -2806,7 +2807,7 @@ func findByPrefix(dir, p string) (model.Session, bool, error) {
 // in the named harness started with the prefix.
 func findByPrefixHarness(dir, p, harness string) (model.Session, bool, error) {
 	if err := ensureForCLIRead(dir); err == nil {
-		if s, ok, err := index.FindByPrefixIn(dir, p, harness); err == nil {
+		if s, ok, err := lookupUnlessNew(dir, func() (model.Session, bool, error) { return index.FindByPrefixIn(dir, p, harness) }); err == nil {
 			if ok {
 				noteForgottenSource(s, p, true)
 			}
@@ -2832,6 +2833,7 @@ func findByPrefixHarness(dir, p, harness string) (model.Session, bool, error) {
 // --harness` comes through here twice when the exact id misses.
 func ensureForCLIRead(dir string) error {
 	busy, err := index.EnsureUnlessBusy(dir, os.Stderr)
+	answeredFromSnapshot.Store(busy)
 	if busy {
 		requestWarmup(dir)
 		saidReadingAsItWas.Do(func() {
@@ -2842,6 +2844,27 @@ func ensureForCLIRead(dir string) error {
 }
 
 var saidReadingAsItWas sync.Once
+
+// answeredFromSnapshot is whether the last ensureForCLIRead skipped the update
+// because another deja held the lock.
+var answeredFromSnapshot atomic.Bool
+
+// lookupUnlessNew runs an id lookup against the snapshot and, when it misses
+// while another deja holds the lock, waits for the index and looks again. A
+// lock held at session start is a hook refresh reading the session that just
+// began, so the id someone copied from it is the one the snapshot cannot have
+// yet: answering "no session matches" for it at once was worse than the wait
+// the snapshot read saves.
+func lookupUnlessNew(dir string, find func() (model.Session, bool, error)) (model.Session, bool, error) {
+	s, ok, err := find()
+	if err != nil || ok || !answeredFromSnapshot.Load() {
+		return s, ok, err
+	}
+	if index.Ensure(dir, "", false, os.Stderr) != nil {
+		return s, ok, err
+	}
+	return find()
+}
 
 func recent(dir string, n int) ([]model.Session, error) {
 	return recentMatching(dir, n, search.Options{})

@@ -101,3 +101,54 @@ func TestLastAndShowAnswerWhileAnotherDejaHoldsTheIndexLock(t *testing.T) {
 		t.Errorf("with the lock free, last said it answered from a stale index:\n%s", stderr)
 	}
 }
+
+// The lock is held at session start by the hook refresh reading the session
+// that just began, so the id someone copies from it is exactly the one the
+// snapshot lacks. A miss under a held lock waits for the index and looks again
+// rather than saying no session matches.
+func TestShowWaitsForASessionTheSnapshotCannotHaveYet(t *testing.T) {
+	dir := seedRecallPage(t)
+	store := filepath.Join(os.Getenv("DEJA_CLAUDE_ROOT"), "-proj")
+	t.Setenv("DEJA_WARMUP_SENTINEL", "")
+	oldSpawn := spawnWarmup
+	spawnWarmup = func(string, string) error { return nil }
+	t.Cleanup(func() { spawnWarmup = oldSpawn })
+
+	for _, tc := range []struct {
+		id   string
+		args []string
+	}{
+		{"sessnewa", []string{"sessnewa"}},
+		{"sessnewb", []string{"sessnewb", "--harness", "claude"}},
+	} {
+		line := `{"type":"user","message":{"role":"user","content":"the session that just began"},` +
+			`"timestamp":"2026-09-01T10:00:00Z","sessionId":"` + tc.id + `","cwd":"/proj"}` + "\n"
+		if err := os.WriteFile(filepath.Join(store, tc.id+".jsonl"), []byte(line), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		unlock := holdIndexLock(t, dir)
+		saidReadingAsItWas = sync.Once{}
+		done := make(chan error, 1)
+		var out string
+		_ = captureStderr(t, func() {
+			out = captureStdout(t, func() {
+				go func() { done <- cmdShow(dir, tc.args, "") }()
+				var err error
+				select {
+				case err = <-done:
+					unlock()
+					t.Errorf("show %v answered before the lock was released: %v", tc.args, err)
+					return
+				case <-time.After(300 * time.Millisecond):
+				}
+				unlock()
+				if err = <-done; err != nil {
+					t.Errorf("show %v after the lock was released: %v", tc.args, err)
+				}
+			})
+		})
+		if !strings.Contains(out, "the session that just began") {
+			t.Errorf("show %v did not find the session the refresh was reading:\n%s", tc.args, out)
+		}
+	}
+}
